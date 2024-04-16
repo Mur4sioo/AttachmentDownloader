@@ -2,6 +2,7 @@
 using System.Collections;
 using System.Linq;
 using System.Net;
+using System.Text.RegularExpressions;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Gmail.v1;
 using Google.Apis.Gmail.v1.Data;
@@ -9,8 +10,6 @@ using Google.Apis.Services;
 namespace AttachmentsDownloader;
 public static class GmailExtensions
 {
-    public static IList<Message> GetMessages(this GmailService service, string userId)
-        => service.Users.Messages.List(userId).Execute().Messages;
     public static async Task<IList<Message>> GetMessagesAsync(this GmailService service, string userId)
         => (await service.Users.Messages.List(userId).ExecuteAsync()).Messages;
 }
@@ -29,7 +28,7 @@ class Program
     
     private static Task<UserCredential> Login(string googleClientId, string googleClientSecret, params string[] scopes)
     {
-        ClientSecrets secrets = new ClientSecrets()
+        ClientSecrets secrets = new ClientSecrets
         {
             ClientId = googleClientId,
             ClientSecret = googleClientSecret
@@ -37,7 +36,27 @@ class Program
         return GoogleWebAuthorizationBroker.AuthorizeAsync(secrets, scopes, "user", CancellationToken.None);
     }
 
-    
+    private record AttachmentInfo(string AttachmentId, string MessageId, string MimeType);
+    private static IEnumerable<AttachmentInfo> GetAllAttachmentIds(MessagePart part, string messageId)
+    {
+        var queue = new Queue<MessagePart>();
+        queue.Enqueue(part);
+        while (queue.TryDequeue(out var item))
+        {
+            if (item.Body.AttachmentId is not null)
+            {
+                yield return new( item.Body.AttachmentId, messageId, item.MimeType);
+            }
+
+            if (item.Parts is null)
+            {
+                continue;
+            }
+            foreach (var subpart in item.Parts)
+                queue.Enqueue(subpart);
+        }
+    }
+
     private static async Task Main(string[] args)
     {
         var userId = "me";
@@ -45,69 +64,88 @@ class Program
         var messageIds = (await gmail.GetMessagesAsync(userId)).Select(message => message.Id);
         var options = new ParallelOptions()
         {
-            MaxDegreeOfParallelism = 10,
+            MaxDegreeOfParallelism = 1,
         };
         await Parallel.ForEachAsync(messageIds, options, async (messageId, cancellationToken) =>
         {
-            var message = await gmail
-                .Users
-                .Messages
-                .Get(userId, messageId)
-                .ExecuteAsync(cancellationToken);
-            var parts = message.Payload.Parts;
-            if (parts != null)
-            {
-                foreach (var part in parts)
-                {
-                    await GetAttachment(message, gmail, userId, part);
-                }
-            }
+            await GetAttachmentsFromMessageId(gmail, userId, messageId, cancellationToken);
         });
 
-        Console.ReadKey();
-    }
-    private static async Task SaveAttachment(MessagePart part, string base64Data, string messageId)
-    {
-        var fileType = part.MimeType;
-        if (fileType == "application/pdf")
-        {
-            var downloadFile =
-                Convert.FromBase64String(base64Data.Replace('-', '+').Replace('_', '/'));
-            var fileName = $"{messageId}.pdf";
-            await File.WriteAllBytesAsync(fileName, downloadFile);
-            Console.WriteLine($"downloaded PDF file : {fileName}");
-        }
-        else
-            Console.WriteLine("Incorrect format");
+        
     }
 
-    private static async Task GetAttachment(GmailService gmail, string userId, string messageId, string attachmentId,
-        MessagePart part)
+    private static async Task GetAttachmentsFromMessageId(GmailService gmail, string userId, string messageId,
+        CancellationToken cancellationToken)
     {
-        var base64Data = (await gmail
+        var message = await gmail
+            .Users
+            .Messages
+            .Get(userId, messageId)
+            .ExecuteAsync(cancellationToken);
+        if (message.Payload is null)
+        {
+            return;
+        }
+
+        foreach (var attachment in GetAllAttachmentIds(message.Payload, messageId))
+        {
+            if (attachment.MimeType != "application/pdf")
+            {
+                Console.WriteLine("Incorrect format");
+            }
+            else
+            {
+                await SaveAttachment(gmail, userId, messageId, attachment);
+            }
+        }
+    }
+    
+    private static async Task SaveAttachment(GmailService gmail, string userId, string messageId, AttachmentInfo attachmentInfo)
+    {
+        var attachment = await gmail
             .Users
             .Messages
             .Attachments
-            .Get(userId, messageId, attachmentId)
-            .ExecuteAsync())
-            .Data;
-
-        // do something with attachment
-        if (base64Data != null)
-        {
-            await SaveAttachment(part, base64Data, messageId);
-        }
+            .Get(userId, attachmentInfo.MessageId, attachmentInfo.AttachmentId)
+            .ExecuteAsync();
+        
+        
+        var subject = GetTitleText(gmail, userId, messageId);
+        var base64Date = attachment.Data;
+        var downloadFile = Convert.FromBase64String(base64Date.Replace('-', '+').Replace('_', '/'));
+        var baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+        var downloadDirectory = Path.Combine(baseDirectory, "download");
+        var fileName = $"{subject}_{DateTime.Today:yyyMMdd}.pdf";
+        var fullPath = Path.Combine(downloadDirectory, fileName);
+        await File.WriteAllBytesAsync(fullPath, downloadFile);
+        Console.WriteLine($"downloaded PDF file : {fileName}");
     }
 
-    private static async Task GetAttachment(Message message, GmailService gmail, string userId, MessagePart part)
+    private static string GetTitleText(GmailService gmail, string userId, string messageId)
     {
-        var attachmentId = message
-            .Payload
-            .Body
-            .AttachmentId;
-        if (attachmentId != null)
+        var tempTitleText = gmail.Users.Messages.Get(userId, messageId);
+        tempTitleText.Format = UsersResource.MessagesResource.GetRequest.FormatEnum.Metadata;
+        tempTitleText.MetadataHeaders = new List<string>{"Subject"};
+        var titleText = tempTitleText.Execute();
+        var subjectHeader = titleText.Payload.Headers.FirstOrDefault(header => header.Name == "Subject");
+        string subject = subjectHeader?.Value?? "Deafult_filename";
+        string detailName;
+        if (subject.Contains("BIEDRONKA"))
         {
-            await GetAttachment(gmail, userId, message.Id, attachmentId, part);
+            Match match = Regex.Match(subject, "BIEDRONKA\\s+(\\d+)");
+            detailName = match.Groups[1].Value;
+            subject = $"B{detailName}";
         }
+        else if(subject.Contains("HEBE"))
+        {
+            Match match = Regex.Match(subject, "HEBE R(\\d+)");
+            detailName = match.Groups[1].Value;
+            subject = $"R{detailName}";
+        }
+        else
+        {
+            subject = "DEAFULT";
+        }
+        return subject;
     }
 }
