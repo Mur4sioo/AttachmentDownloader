@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections;
 using System.Linq;
 using System.Net;
 using Google.Apis.Auth.OAuth2;
@@ -10,80 +11,103 @@ public static class GmailExtensions
 {
     public static IList<Message> GetMessages(this GmailService service, string userId)
         => service.Users.Messages.List(userId).Execute().Messages;
+    public static async Task<IList<Message>> GetMessagesAsync(this GmailService service, string userId)
+        => (await service.Users.Messages.List(userId).ExecuteAsync()).Messages;
 }
+
 class Program
 {
+    private static async Task<GmailService> CreateGmailService(string googleClientId, string googleClientSecret)
+    {
+        UserCredential credential = await Login(googleClientId, googleClientSecret, GmailService.Scope.GmailReadonly);
+        var initializer = new BaseClientService.Initializer()
+        {
+            HttpClientInitializer = credential
+        };
+        return new GmailService(initializer);
+    }
     
-    private static UserCredential Login(string googleClientId, string googleClientSecret, string[] scopes)
+    private static Task<UserCredential> Login(string googleClientId, string googleClientSecret, params string[] scopes)
     {
         ClientSecrets secrets = new ClientSecrets()
         {
             ClientId = googleClientId,
             ClientSecret = googleClientSecret
         };
-        return GoogleWebAuthorizationBroker.AuthorizeAsync(secrets, scopes, "user", CancellationToken.None).Result;
+        return GoogleWebAuthorizationBroker.AuthorizeAsync(secrets, scopes, "user", CancellationToken.None);
     }
-    static void Main(string[] args)
+
+    
+    private static async Task Main(string[] args)
     {
         var userId = "me";
-        var googleClientId = "";
-        var googleClientSecret = "";
-        string[] scopes = new[] { Google.Apis.Gmail.v1.GmailService.Scope.GmailReadonly };
-        UserCredential credential = Login(googleClientId, googleClientSecret, scopes);
-        var initializer = new BaseClientService.Initializer()
+        using var gmail = await CreateGmailService(googleClientId: "", googleClientSecret: "");
+        var messageIds = (await gmail.GetMessagesAsync(userId)).Select(message => message.Id);
+        var options = new ParallelOptions()
         {
-            HttpClientInitializer = credential
+            MaxDegreeOfParallelism = 10,
         };
-        using var gmail = new GmailService(initializer);
-
-        var messageIds = GmailExtensions.GetMessages(gmail,userId).Select(message => message.Id);
-
-        foreach(var messageId in messageIds)
+        await Parallel.ForEachAsync(messageIds, options, async (messageId, cancellationToken) =>
         {
-            var message = gmail
+            var message = await gmail
                 .Users
                 .Messages
                 .Get(userId, messageId)
-                .Execute();
+                .ExecuteAsync(cancellationToken);
             var parts = message.Payload.Parts;
             if (parts != null)
             {
                 foreach (var part in parts)
                 {
-                    var attachmentId = message
-                        .Payload
-                        .Body
-                        .AttachmentId;
-                    if (attachmentId != null)
-                    {
-                        var base64Data = gmail
-                            .Users
-                            .Messages
-                            .Attachments
-                            .Get(userId, messageId, attachmentId)
-                            .Execute()
-                            .Data;
-
-                        // do something with attachment
-                        if (base64Data != null)
-                        {
-                            var fileType = part.MimeType;
-                            if (fileType == "application/pdf")
-                            {
-                                var downloadFile =
-                                    Convert.FromBase64String(base64Data.Replace('-', '+').Replace('_', '/'));
-                                var fileName = $"{messageId}.pdf";
-                                File.WriteAllBytes(fileName, downloadFile);
-                                Console.WriteLine($"downloaded PDF file : {fileName}");
-                            }
-                            else
-                                Console.WriteLine("Incorrect format");
-                        }
-                    }
+                    await GetAttachment(message, gmail, userId, part);
                 }
             }
-        }
+        });
 
         Console.ReadKey();
+    }
+    private static async Task SaveAttachment(MessagePart part, string base64Data, string messageId)
+    {
+        var fileType = part.MimeType;
+        if (fileType == "application/pdf")
+        {
+            var downloadFile =
+                Convert.FromBase64String(base64Data.Replace('-', '+').Replace('_', '/'));
+            var fileName = $"{messageId}.pdf";
+            await File.WriteAllBytesAsync(fileName, downloadFile);
+            Console.WriteLine($"downloaded PDF file : {fileName}");
+        }
+        else
+            Console.WriteLine("Incorrect format");
+    }
+
+    private static async Task GetAttachment(GmailService gmail, string userId, string messageId, string attachmentId,
+        MessagePart part)
+    {
+        var base64Data = (await gmail
+            .Users
+            .Messages
+            .Attachments
+            .Get(userId, messageId, attachmentId)
+            .ExecuteAsync())
+            .Data;
+
+        // do something with attachment
+        if (base64Data != null)
+        {
+            await SaveAttachment(part, base64Data, messageId);
+        }
+    }
+
+    private static async Task GetAttachment(Message message, GmailService gmail, string userId, MessagePart part)
+    {
+        var attachmentId = message
+            .Payload
+            .Body
+            .AttachmentId;
+        if (attachmentId != null)
+        {
+            await GetAttachment(gmail, userId, message.Id, attachmentId, part);
+        }
     }
 }
