@@ -7,6 +7,8 @@ using Google.Apis.Auth.OAuth2;
 using Google.Apis.Gmail.v1;
 using Google.Apis.Gmail.v1.Data;
 using Google.Apis.Services;
+using Google.Apis.Util.Store;
+
 namespace AttachmentsDownloader;
 public static class GmailExtensions
 {
@@ -16,25 +18,28 @@ public static class GmailExtensions
 
 class Program
 {
-    private static async Task<GmailService> CreateGmailService(string googleClientId, string googleClientSecret)
+    private static async Task<GmailService> CreateGmailService()
     {
-        UserCredential credential = await Login(googleClientId, googleClientSecret, GmailService.Scope.GmailReadonly);
-        var initializer = new BaseClientService.Initializer()
+
+        UserCredential credential;
+        using (var stream = new FileStream("client_secrets.json", FileMode.Open, FileAccess.Read))
         {
-            HttpClientInitializer = credential
-        };
-        return new GmailService(initializer);
-    }
-    
-    private static Task<UserCredential> Login(string googleClientId, string googleClientSecret, params string[] scopes)
-    {
-        ClientSecrets secrets = new ClientSecrets
+            string credPath = "token.json";
+            credential = GoogleWebAuthorizationBroker.AuthorizeAsync(
+                GoogleClientSecrets.Load(stream).Secrets,
+                new[] { GmailService.Scope.GmailReadonly },
+                "user",
+                CancellationToken.None,
+                new FileDataStore(credPath, true)).Result;
+        }
+        
+        return new GmailService(new BaseClientService.Initializer
         {
-            ClientId = googleClientId,
-            ClientSecret = googleClientSecret
-        };
-        return GoogleWebAuthorizationBroker.AuthorizeAsync(secrets, scopes, "user", CancellationToken.None);
-    }
+            HttpClientInitializer = credential,
+            ApplicationName = "Gmail Attachment Downloader"
+        
+        });
+}
 
     private record AttachmentInfo(string AttachmentId, string MessageId, string MimeType);
     private static IEnumerable<AttachmentInfo> GetAllAttachmentIds(MessagePart part, string messageId)
@@ -59,8 +64,8 @@ class Program
 
     private static async Task Main(string[] args)
     {
+        using var gmail = await CreateGmailService();
         var userId = "me";
-        using var gmail = await CreateGmailService(googleClientId: "", googleClientSecret: "");
         var messageIds = (await gmail.GetMessagesAsync(userId)).Select(message => message.Id);
         var options = new ParallelOptions()
         {
