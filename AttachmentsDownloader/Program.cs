@@ -13,24 +13,31 @@ namespace AttachmentsDownloader;
 public static class GmailExtensions
 {
     public static async Task<IList<Message>> GetMessagesAsync(this GmailService service, string userId)
-        => (await service.Users.Messages.List(userId).ExecuteAsync()).Messages;
+    {
+        var request = service.Users.Messages.List(userId);
+        request.MaxResults = 500;
+        var messages = (await request.ExecuteAsync()).Messages;
+        return messages;
+    }
+        //=> (await service.Users.Messages.List(userId).ExecuteAsync()).Messages;
 }
 
 class Program
 {
+    [Obsolete("Obsolete")]
     private static async Task<GmailService> CreateGmailService()
     {
 
         UserCredential credential;
-        using (var stream = new FileStream("client_secrets.json", FileMode.Open, FileAccess.Read))
+        await using (var stream = new FileStream("client_secrets.json", FileMode.Open, FileAccess.Read))
         {
-            string credPath = "token.json";
-            credential = GoogleWebAuthorizationBroker.AuthorizeAsync(
+            const string credPath = "token.json";
+            credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
                 GoogleClientSecrets.Load(stream).Secrets,
                 new[] { GmailService.Scope.GmailReadonly },
                 "user",
                 CancellationToken.None,
-                new FileDataStore(credPath, true)).Result;
+                new FileDataStore(credPath, true));
         }
         
         return new GmailService(new BaseClientService.Initializer
@@ -41,7 +48,7 @@ class Program
         });
 }
 
-    private record AttachmentInfo(string AttachmentId, string MessageId, string MimeType);
+    private record AttachmentInfo(string AttachmentId, string MessageId, string MimeType, string FileName);
     private static IEnumerable<AttachmentInfo> GetAllAttachmentIds(MessagePart part, string messageId)
     {
         var queue = new Queue<MessagePart>();
@@ -50,7 +57,7 @@ class Program
         {
             if (item.Body.AttachmentId is not null)
             {
-                yield return new( item.Body.AttachmentId, messageId, item.MimeType);
+                yield return new( item.Body.AttachmentId, messageId, item.MimeType, item.Filename);
             }
 
             if (item.Parts is null)
@@ -61,7 +68,21 @@ class Program
                 queue.Enqueue(subpart);
         }
     }
+    
+    private static bool IsAttachmentPdf(MessagePart attachment)
+    {
+        if (attachment.MimeType.Equals("application/octet-stream", StringComparison.OrdinalIgnoreCase)
+            && (attachment.Filename.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)))
+            return true;
+        if (attachment.MimeType == "application/pdf")
+        {
+            return true;
+        }
 
+        return false;
+    }
+
+    [Obsolete("Obsolete")]
     private static async Task Main(string[] args)
     {
         using var gmail = await CreateGmailService();
@@ -69,7 +90,7 @@ class Program
         var messageIds = (await gmail.GetMessagesAsync(userId)).Select(message => message.Id);
         var options = new ParallelOptions()
         {
-            MaxDegreeOfParallelism = 1,
+            MaxDegreeOfParallelism = 10,
         };
         await Parallel.ForEachAsync(messageIds, options, async (messageId, cancellationToken) =>
         {
@@ -87,6 +108,9 @@ class Program
             .Messages
             .Get(userId, messageId)
             .ExecuteAsync(cancellationToken);
+        /*var request = gmail.Users.Messages.Get(userId, messageId);
+        request.Fields = "payload(headers,parts(body, mimeType, filename))";
+        var message = await request.ExecuteAsync(cancellationToken);*/
         if (message.Payload is null)
         {
             return;
@@ -94,14 +118,13 @@ class Program
 
         foreach (var attachment in GetAllAttachmentIds(message.Payload, messageId))
         {
-            if (attachment.MimeType != "application/pdf")
-            {
-                Console.WriteLine("Incorrect format");
-            }
-            else
-            {
+            var title =message.Payload.Headers.FirstOrDefault(header => header.Name == "Subject");
+            Console.WriteLine(title.Value);
+            Console.WriteLine($"{attachment.MimeType}");
+            if (IsAttachmentPdf(message.Payload))
                 await SaveAttachment(gmail, userId, messageId, attachment);
-            }
+            else
+                Console.WriteLine("Incorrect format.");
         }
     }
     
