@@ -2,6 +2,7 @@
 using System.Collections;
 using System.Linq;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Gmail.v1;
@@ -19,11 +20,12 @@ public static class GmailExtensions
         var messages = (await request.ExecuteAsync()).Messages;
         return messages;
     }
-        //=> (await service.Users.Messages.List(userId).ExecuteAsync()).Messages;
+    
 }
 
 class Program
 {
+    private static HashSet<string> fileChecksums = new HashSet<string>();
     [Obsolete("Obsolete")]
     private static async Task<GmailService> CreateGmailService()
     {
@@ -69,10 +71,10 @@ class Program
         }
     }
     
-    private static bool IsAttachmentPdf(MessagePart attachment)
+    private static bool IsAttachmentPdf(AttachmentInfo attachment)
     {
         if (attachment.MimeType.Equals("application/octet-stream", StringComparison.OrdinalIgnoreCase)
-            && (attachment.Filename.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)))
+            && (attachment.FileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)))
             return true;
         if (attachment.MimeType == "application/pdf")
         {
@@ -90,7 +92,7 @@ class Program
         var messageIds = (await gmail.GetMessagesAsync(userId)).Select(message => message.Id);
         var options = new ParallelOptions()
         {
-            MaxDegreeOfParallelism = 10,
+            MaxDegreeOfParallelism = 1,
         };
         await Parallel.ForEachAsync(messageIds, options, async (messageId, cancellationToken) =>
         {
@@ -108,9 +110,6 @@ class Program
             .Messages
             .Get(userId, messageId)
             .ExecuteAsync(cancellationToken);
-        /*var request = gmail.Users.Messages.Get(userId, messageId);
-        request.Fields = "payload(headers,parts(body, mimeType, filename))";
-        var message = await request.ExecuteAsync(cancellationToken);*/
         if (message.Payload is null)
         {
             return;
@@ -118,11 +117,13 @@ class Program
 
         foreach (var attachment in GetAllAttachmentIds(message.Payload, messageId))
         {
-            var title =message.Payload.Headers.FirstOrDefault(header => header.Name == "Subject");
-            Console.WriteLine(title.Value);
-            Console.WriteLine($"{attachment.MimeType}");
-            if (IsAttachmentPdf(message.Payload))
+
+            if (IsAttachmentPdf(attachment))
+            {
+                var title = message.Payload.Headers.FirstOrDefault(header => header.Name == "Subject");
+                Console.WriteLine(title.Value);
                 await SaveAttachment(gmail, userId, messageId, attachment);
+            }
             else
                 Console.WriteLine("Incorrect format.");
         }
@@ -130,23 +131,29 @@ class Program
     
     private static async Task SaveAttachment(GmailService gmail, string userId, string messageId, AttachmentInfo attachmentInfo)
     {
+        
         var attachment = await gmail
             .Users
             .Messages
             .Attachments
             .Get(userId, attachmentInfo.MessageId, attachmentInfo.AttachmentId)
             .ExecuteAsync();
-        
-        
-        var subject = GetTitleText(gmail, userId, messageId);
-        var base64Date = attachment.Data;
-        var downloadFile = Convert.FromBase64String(base64Date.Replace('-', '+').Replace('_', '/'));
-        var baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
-        var downloadDirectory = Path.Combine(baseDirectory, "download");
-        var fileName = $"{subject}_{DateTime.Today:yyyMMdd}.pdf";
-        var fullPath = Path.Combine(downloadDirectory, fileName);
-        await File.WriteAllBytesAsync(fullPath, downloadFile);
-        Console.WriteLine($"downloaded PDF file : {fileName}");
+        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "download", "TEMP_FILE.pdf");
+        DownloadTempFile(attachment);
+        string fileChecksum =
+            ComputeMd5Checksum(path);
+        if (fileChecksums.Contains(fileChecksum))
+        {
+            Console.WriteLine("File was already downloaded.");
+            File.Delete(path);
+        }
+        else
+        {
+            fileChecksums.Add(fileChecksum);
+            Console.WriteLine("New file downloading...");
+            File.Delete(path);
+            DownloadNewFile(gmail, userId, messageId, attachment);
+        }
     }
 
     private static string GetTitleText(GmailService gmail, string userId, string messageId)
@@ -160,13 +167,13 @@ class Program
         string detailName;
         if (subject.Contains("BIEDRONKA"))
         {
-            Match match = Regex.Match(subject, "BIEDRONKA\\s+(\\d+)");
+            var match = Regex.Match(subject, "BIEDRONKA\\s+(\\d+)");
             detailName = match.Groups[1].Value;
             subject = $"B{detailName}";
         }
         else if(subject.Contains("HEBE"))
         {
-            Match match = Regex.Match(subject, "HEBE R(\\d+)");
+            var match = Regex.Match(subject, "HEBE\\s+R(\\d+)");
             detailName = match.Groups[1].Value;
             subject = $"R{detailName}";
         }
@@ -175,5 +182,29 @@ class Program
             subject = "DEAFULT";
         }
         return subject;
+    }
+
+    private static void DownloadTempFile(MessagePartBody attachment)
+    {
+        var downloadFile = Convert.FromBase64String((attachment.Data).Replace('-', '+').Replace('_', '/'));
+        var fileName = "TEMP_FILE.pdf";
+        var downloadDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "download", fileName);
+        File.WriteAllBytes(downloadDirectory,downloadFile);
+    }
+    private static void DownloadNewFile(GmailService gmail, string userId, string messageId, MessagePartBody attachment)
+    {
+        var downloadFile = Convert.FromBase64String((attachment.Data).Replace('-', '+').Replace('_', '/'));
+        var fileNamePart = GetTitleText(gmail, userId, messageId);
+        var fileName = $"{fileNamePart}_PN_{DateTime.Today:yyyMMdd}.pdf";
+        var downloadDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "download", fileName);
+        File.WriteAllBytes(downloadDirectory,downloadFile);
+        Console.WriteLine($"downloaded file {fileName}");
+    }
+    private static string ComputeMd5Checksum(string filePath)
+    {
+        using var md5 = MD5.Create();
+        using var stream = File.OpenRead(filePath);
+        var hash = md5.ComputeHash(stream);
+        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
     }
 }
