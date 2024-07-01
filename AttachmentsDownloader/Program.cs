@@ -40,6 +40,7 @@ class Program
                 "user",
                 CancellationToken.None,
                 new FileDataStore(credPath, true));
+            test
         }
         
         return new GmailService(new BaseClientService.Initializer
