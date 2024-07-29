@@ -9,6 +9,7 @@ using Google.Apis.Gmail.v1;
 using Google.Apis.Gmail.v1.Data;
 using Google.Apis.Services;
 using Google.Apis.Util.Store;
+using Newtonsoft.Json;
 
 namespace AttachmentsDownloader;
 public static class GmailExtensions
@@ -26,6 +27,42 @@ public static class GmailExtensions
 class Program
 {
     private static HashSet<string> fileChecksums = new HashSet<string>();
+    private static List<string> fileNames = new List<string>();
+
+    private static void loadHashes()
+    {
+        string filehashset = "hashset.json";
+        if (File.Exists(filehashset))
+        {
+            var jsonDataHash = File.ReadAllText(filehashset);
+            fileChecksums = JsonConvert.DeserializeObject<HashSet<string>>(jsonDataHash) ?? new HashSet<string>();
+        }
+        else
+        {
+            File.Create("hashset.json");
+        }
+        string fileName = "filename.json";
+        if (File.Exists(fileName))
+        {
+            var jsonDataName = File.ReadAllText(fileName);
+            fileNames = JsonConvert.DeserializeObject<List<string>>(jsonDataName) ?? new List<string>();
+        }
+        else
+        {
+            File.Create("filename.json");
+        }
+    }
+
+    private static void saveHashes()
+    {
+        string fileHashset = "hashset.json";
+        string jsonDataHash = JsonConvert.SerializeObject(fileChecksums, Formatting.Indented);
+        File.WriteAllText(fileHashset, jsonDataHash);
+
+        string fileName = "filename.json";
+        string jsonDataName = JsonConvert.SerializeObject(fileNames, Formatting.Indented);
+        File.WriteAllText(fileName, jsonDataName);
+    }
     [Obsolete("Obsolete")]
     private static async Task<GmailService> CreateGmailService()
     {
@@ -40,7 +77,6 @@ class Program
                 "user",
                 CancellationToken.None,
                 new FileDataStore(credPath, true));
-            test
         }
         
         return new GmailService(new BaseClientService.Initializer
@@ -95,12 +131,12 @@ class Program
         {
             MaxDegreeOfParallelism = 1,
         };
+        loadHashes();
         await Parallel.ForEachAsync(messageIds, options, async (messageId, cancellationToken) =>
         {
             await GetAttachmentsFromMessageId(gmail, userId, messageId, cancellationToken);
         });
-
-        
+        saveHashes();
     }
 
     private static async Task GetAttachmentsFromMessageId(GmailService gmail, string userId, string messageId,
@@ -139,21 +175,19 @@ class Program
             .Attachments
             .Get(userId, attachmentInfo.MessageId, attachmentInfo.AttachmentId)
             .ExecuteAsync();
-        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "download", "TEMP_FILE.pdf");
-        DownloadTempFile(attachment);
-        string fileChecksum =
-            ComputeMd5Checksum(path);
-        if (fileChecksums.Contains(fileChecksum))
+        var title = $"{GetTitleText(gmail, userId, messageId)}";
+        var date = $"{GetDateText(gmail, userId, messageId)}";
+        var filename = $"{GetFileName(title, date)}.pdf";
+        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "download", filename);
+        var downloadFile = Convert.FromBase64String((attachment.Data).Replace('-', '+').Replace('_', '/'));
+        if (!IsDownloaded(downloadFile))
         {
-            Console.WriteLine("File was already downloaded.");
-            File.Delete(path);
+            Console.WriteLine($"Downloading ... {filename}");
+            File.WriteAllBytes(path, downloadFile);
         }
         else
         {
-            fileChecksums.Add(fileChecksum);
-            Console.WriteLine("New file downloading...");
-            File.Delete(path);
-            DownloadNewFile(gmail, userId, messageId, attachment);
+            Console.WriteLine($"File {filename} already downloaded.");
         }
     }
 
@@ -185,27 +219,44 @@ class Program
         return subject;
     }
 
-    private static void DownloadTempFile(MessagePartBody attachment)
+    private static string GetDateText(GmailService gmail, string userId, string messageId)
     {
-        var downloadFile = Convert.FromBase64String((attachment.Data).Replace('-', '+').Replace('_', '/'));
-        var fileName = "TEMP_FILE.pdf";
-        var downloadDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "download", fileName);
-        File.WriteAllBytes(downloadDirectory,downloadFile);
+        var message = gmail.Users.Messages.Get(userId, messageId).Execute();
+        var dateHeader = message.Payload.Headers?.FirstOrDefault(header => header.Name.Equals("Date", StringComparison.OrdinalIgnoreCase));
+        var dateString = dateHeader?.Value ?? "";
+        dateString.ToString("yyyyMMdd");
+        return dateString;
     }
-    private static void DownloadNewFile(GmailService gmail, string userId, string messageId, MessagePartBody attachment)
+
+    private static string GetFileName(string title, string date)
     {
-        var downloadFile = Convert.FromBase64String((attachment.Data).Replace('-', '+').Replace('_', '/'));
-        var fileNamePart = GetTitleText(gmail, userId, messageId);
-        var fileName = $"{fileNamePart}_PN_{DateTime.Today:yyyMMdd}.pdf";
-        var downloadDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "download", fileName);
-        File.WriteAllBytes(downloadDirectory,downloadFile);
-        Console.WriteLine($"downloaded file {fileName}");
+        var name = $"{title}_PN_{date}";
+        int i = 1;
+        while (fileNames.Contains(name))
+        {
+            name = $"{title}_PN_Z{i}_{date}";
+            i++;
+        }
+        fileNames.Add(name);
+        return name;
     }
-    private static string ComputeMd5Checksum(string filePath)
+    
+    private static bool IsDownloaded(byte[] attachment)
     {
-        using var md5 = MD5.Create();
-        using var stream = File.OpenRead(filePath);
-        var hash = md5.ComputeHash(stream);
-        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+        var hash = ComputeHash(attachment);
+        if (fileChecksums.Contains(hash))
+        {
+            return true;
+        }
+        fileChecksums.Add(hash);
+        return false;
+    }
+    private static string ComputeHash(byte[] byteArray)
+    {
+        using (SHA256 sha256 = SHA256.Create())
+        {
+            byte[] hashBytes = sha256.ComputeHash(byteArray);
+            return BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
+        }
     }
 }
